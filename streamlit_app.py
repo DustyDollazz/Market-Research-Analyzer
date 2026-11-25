@@ -7,6 +7,7 @@ import pandas as pd
 import requests
 import yfinance as yf
 import streamlit as st
+import altair as alt
 from scipy.stats import pearsonr
 from statsmodels.stats.multitest import multipletests
 STATION='9410660'
@@ -172,15 +173,65 @@ for tab,mode in [(tidal,"Tidal"),(lunar,"Lunar")]:
                 st.dataframe(data)
                 st.bar_chart(data.head(25).set_index("ticker")["evidence"])
 with charts:
-    symbol=st.text_input("Chart ticker","SPY")
-    if st.button("Load daily chart"):
+    candidates = sorted({str(t) for v in results.values() if not isinstance(v,str) for t in v[0]["ticker"]})
+    selected = st.selectbox("Choose analyzed symbol", ["Custom"] + candidates)
+    symbol = st.text_input("Chart ticker", "SPY") if selected == "Custom" else selected
+    period = st.selectbox("Chart period", ["1d","5d","1mo","3mo"], index=1)
+    overlays = st.multiselect("Show lines", ["Stock price","Tidal height","Lunar illumination"], default=["Stock price","Tidal height","Lunar illumination"])
+    if st.button("Load comparison chart"):
         try:
+            interval = "5m" if period != "3mo" else "1d"
             with workers()[1]:
-                raw=yf.download(symbol,period="3mo",auto_adjust=True,progress=False,threads=False)
+                raw = yf.download(symbol.strip().upper(), period=period, interval=interval, auto_adjust=True, progress=False, threads=False)
             if raw.empty: raise ValueError("No prices returned")
-            close=raw["Close"].squeeze()
-            st.line_chart(close)
-        except Exception as e: st.error(str(e))
+            close = raw["Close"]
+            if isinstance(close,pd.DataFrame): close=close.iloc[:,0]
+            close=close.dropna()
+            if close.empty: raise ValueError("No valid prices returned")
+            idx=pd.DatetimeIndex(close.index)
+            if idx.tz is not None: idx=idx.tz_convert("America/Los_Angeles").tz_localize(None)
+            prices=pd.DataFrame({"time":idx,"value":close.to_numpy()})
+            st.session_state["comparison"]=(symbol,period,interval,prices)
+        except Exception as e:
+            st.session_state.pop("comparison",None)
+            st.error(str(e))
+    if "comparison" in st.session_state:
+        sym,per,interval,prices=st.session_state["comparison"]
+        start=prices.time.min()
+        end=prices.time.max()
+        st.caption(f"{sym} | {per} | {interval} prices | Pacific time. Overlays are unshifted.")
+        layers=[]
+        def line(frame,label,color,orient):
+            return alt.Chart(frame).mark_line(color=color).encode(
+                x=alt.X("time:T",title="Pacific time"),
+                y=alt.Y("value:Q",title=label,axis=alt.Axis(orient=orient,titleColor=color),scale=alt.Scale(zero=False)),
+                tooltip=[alt.Tooltip("time:T"),alt.Tooltip("value:Q",title=label,format=".3f")])
+        if "Stock price" in overlays:
+            layers.append(line(prices,"Stock price (USD for US listings)","#2563eb","left"))
+        if "Tidal height" in overlays:
+            try:
+                @st.cache_data(ttl=3600)
+                def chart_tides(first,last):
+                    params={"begin_date":first,"end_date":last,"station":STATION,"product":"predictions","datum":"MLLW","time_zone":"lst_ldt","units":"metric","interval":"6","format":"json","application":"StockTideAnalyzer"}
+                    response=requests.get("https://api.tidesandcurrents.noaa.gov/api/prod/datagetter",params=params,timeout=60)
+                    response.raise_for_status()
+                    obj=response.json()
+                    if "predictions" not in obj: raise ValueError(str(obj.get("error",obj)))
+                    frame=pd.DataFrame(obj["predictions"])
+                    return pd.DataFrame({"time":pd.to_datetime(frame.t),"value":pd.to_numeric(frame.v,errors="coerce")})
+                tide=chart_tides(start.strftime("%Y%m%d"),end.strftime("%Y%m%d"))
+                tide=tide[tide.time.between(start,end)]
+                layers.append(line(tide,"Predicted tide (m MLLW)","#ea580c","right"))
+            except Exception as e: st.warning(f"Tide overlay unavailable: {e}")
+        if "Lunar illumination" in overlays:
+            dates=pd.date_range(start,end,freq="h")
+            utc=dates.tz_localize("America/Los_Angeles",ambiguous="NaT",nonexistent="shift_forward").tz_convert("UTC").tz_localize(None)
+            age=(utc-pd.Timestamp("2000-01-06 18:14")).total_seconds()/86400
+            moon=pd.DataFrame({"time":dates,"value":100*(1-np.cos(2*np.pi*age/29.530588853))/2})
+            layers.append(line(moon,"Approx. lunar illumination (%)","#9333ea","right"))
+        if layers:
+            st.altair_chart(alt.layer(*layers).resolve_scale(y="independent").properties(height=480).interactive(bind_y=False),use_container_width=True)
+        st.caption("Price lines may bridge market closures. Tide predictions are six-minute values; lunar illumination is approximate. Visual alignment is not proof of predictive correlation.")
 with report:
     for mode,value in results.items():
         if not isinstance(value,str):
